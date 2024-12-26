@@ -10,7 +10,6 @@ import librosa
 import torch.distributed as dist
 from tqdm import tqdm
 
-
 def gen_jsonl_from_wav_text_list(
     path,
     data_type_list=("source", "target"),
@@ -25,90 +24,98 @@ def gen_jsonl_from_wav_text_list(
     cpu_cores = os.cpu_count() or 1
     print(f"Rank {rank}: convert wav.scp text to jsonl, ncpu: {cpu_cores}")
 
-    if rank == 0:
-        json_dict = {}
-        for data_type, data_file in zip(data_type_list, path):
-            json_dict[data_type] = {}
-            with open(data_file, "r") as f:
-                data_file_lists = f.readlines()
-                lines_for_each_rank = (len(data_file_lists) - 1) // world_size + 1
-                start_idx = rank * lines_for_each_rank
-                end_idx = min((rank + 1) * lines_for_each_rank, len(data_file_lists))
-                data_file_lists = data_file_lists[start_idx:end_idx]
+    json_dict = {}
+    for data_type, data_file in zip(data_type_list, path):
+        json_dict[data_type] = {}
+        with open(data_file, "r") as f:
+            data_file_lists = f.readlines()
+            lines_for_each_rank = (len(data_file_lists) - 1) // world_size + 1
+            start_idx = rank * lines_for_each_rank
+            end_idx = min((rank + 1) * lines_for_each_rank, len(data_file_lists))
+            data_file_lists = data_file_lists[start_idx:end_idx]
 
-                lines_for_each_th = (len(data_file_lists) - 1) // cpu_cores + 1
-                task_num = cpu_cores if len(data_file_lists) > cpu_cores else 1
+            lines_for_each_th = (len(data_file_lists) - 1) // cpu_cores + 1
+            task_num = cpu_cores if len(data_file_lists) > cpu_cores else 1
 
-                if task_num > 1:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_cores) as executor:
-                        futures = [
-                            executor.submit(
-                                parse_context_length,
-                                data_file_lists[
-                                    i * lines_for_each_th : (i + 1) * lines_for_each_th
-                                ],
-                                data_type,
-                                i,
-                            )
-                            for i in range(task_num)
-                        ]
+            if task_num > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_cores) as executor:
+                    futures = [
+                        executor.submit(
+                            parse_context_length,
+                            data_file_lists[
+                                i * lines_for_each_th : (i + 1) * lines_for_each_th
+                            ],
+                            data_type,
+                            i,
+                        )
+                        for i in range(task_num)
+                    ]
 
-                        for future in concurrent.futures.as_completed(futures):
-                            json_dict[data_type].update(future.result())
-                else:
-                    res = parse_context_length(data_file_lists, data_type)
-                    json_dict[data_type].update(res)
+                    for future in concurrent.futures.as_completed(futures):
+                        json_dict[data_type].update(future.result())
+            else:
+                res = parse_context_length(data_file_lists, data_type)
+                json_dict[data_type].update(res)
 
-        if "text_language" not in data_type_list or "emo_target" not in data_type_list or "event_target" not in data_type_list:
-            from funasr import AutoModel
+    if "text_language" not in data_type_list or "emo_target" not in data_type_list or "event_target" not in data_type_list:
+        from funasr import AutoModel
 
-            model = AutoModel(model=model_dir).to(rank)
-            rich_dict = {}
-            source_keys = list(json_dict["source"].keys())
-            source_wavs = [json_dict["source"][key]["source"] for key in source_keys]
+        model = AutoModel(model=model_dir).to(rank)
+        rich_dict = {}
+        source_keys = list(json_dict["source"].keys())
+        source_wavs = [json_dict["source"][key]["source"] for key in source_keys]
 
-            for i in range(0, len(source_keys), batch_size):
-                batch_keys = source_keys[i : i + batch_size]
-                batch_wavs = source_wavs[i : i + batch_size]
+        for i in range(0, len(source_keys), batch_size):
+            batch_keys = source_keys[i : i + batch_size]
+            batch_wavs = source_wavs[i : i + batch_size]
 
-                res_batch = model.generate(
-                    input=batch_wavs,
-                    cache={},
-                    language="auto",
-                    use_itn=True,
-                    batch_size=batch_size,
-                )
+            res_batch = model.generate(
+                input=batch_wavs,
+                cache={},
+                language="auto",
+                use_itn=True,
+                batch_size=batch_size,
+            )
 
-                for key, res in zip(batch_keys, res_batch):
-                    text = res["text"]
-                    pattern = r"<\|[^|]+\|>"
-                    matches = re.findall(pattern, text)
-                    text_language, emo_target, event_target = matches[:3]
-                    rich_dict[key] = [text_language, emo_target, event_target]
+            for key, res in zip(batch_keys, res_batch):
+                text = res["text"]
+                pattern = r"<\|[^|]+\|>"
+                matches = re.findall(pattern, text)
+                text_language, emo_target, event_target = matches[:3]
+                rich_dict[key] = [text_language, emo_target, event_target]
 
-            if "text_language" not in data_type_list:
-                data_type_list.append("text_language")
-                json_dict["text_language"] = {key: {"text_language": rich_dict[key][0]} for key in rich_dict}
+        if "text_language" not in data_type_list:
+            data_type_list.append("text_language")
+            json_dict["text_language"] = {key: {"text_language": rich_dict[key][0]} for key in rich_dict}
 
-            if "emo_target" not in data_type_list:
-                data_type_list.append("emo_target")
-                json_dict["emo_target"] = {key: {"emo_target": rich_dict[key][1]} for key in rich_dict}
+        if "emo_target" not in data_type_list:
+            data_type_list.append("emo_target")
+            json_dict["emo_target"] = {key: {"emo_target": rich_dict[key][1]} for key in rich_dict}
 
-            if "event_target" not in data_type_list:
-                data_type_list.append("event_target")
-                json_dict["event_target"] = {key: {"event_target": rich_dict[key][2]} for key in rich_dict}
+        if "event_target" not in data_type_list:
+            data_type_list.append("event_target")
+            json_dict["event_target"] = {key: {"event_target": rich_dict[key][2]} for key in rich_dict}
 
-        with open(jsonl_file_out, "w") as f:
-            for key in json_dict[data_type_list[0]].keys():
-                jsonl_line = {"key": key}
-                for data_file in data_type_list:
-                    jsonl_line.update(json_dict[data_file][key])
-                jsonl_line = json.dumps(jsonl_line, ensure_ascii=False)
-                f.write(jsonl_line + "\n")
-                f.flush()
-        print(f"Rank {rank}: processed {len(json_dict[data_type_list[0]])} samples")
+    temp_jsonl_file = f"{jsonl_file_out}.{rank}.tmp"
+    with open(temp_jsonl_file, "w") as f:
+        for key in json_dict[data_type_list[0]].keys():
+            jsonl_line = {"key": key}
+            for data_file in data_type_list:
+                jsonl_line.update(json_dict[data_file][key])
+            jsonl_line = json.dumps(jsonl_line, ensure_ascii=False)
+            f.write(jsonl_line + "\n")
+            f.flush()
+    print(f"Rank {rank}: processed {len(json_dict[data_type_list[0]])} samples")
 
     dist.barrier()
+
+    if rank == 0:
+        with open(jsonl_file_out, "w") as final_f:
+            for r in range(world_size):
+                temp_file = f"{jsonl_file_out}.{r}.tmp"
+                with open(temp_file, "r") as f:
+                    final_f.writelines(f.readlines())
+                os.remove(temp_file)
 
 
 def contains_punctuation(s):
